@@ -124,24 +124,24 @@ class AudioCacheManager:
 # --------- TTSV2 ------------
 class IndexTTS2:
     def __init__(
-            self, model_dir=models_path_v2, cfg_path=f"{models_path_v2}/config.yaml", is_fp16=False, device=None,
+            self, model_dir=models_path_v2, cfg_path=f"{models_path_v2}/config.yaml", deepspeed=False, device=None,
             use_cuda_kernel=None,
     ):
         """
         Args:
             cfg_path (str): path to the config file.
             model_dir (str): path to the model directory.
-            is_fp16 (bool): whether to use fp16.
+            deepspeed (bool): whether to use deepspeed.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
         """
         if device is not None:
             self.device = device
-            self.is_fp16 = False if device == "cpu" else is_fp16
+            self.is_fp16 = False if device == "cpu" else deepspeed
             self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
         elif torch.cuda.is_available():
             self.device = "cuda:0"
-            self.is_fp16 = is_fp16
+            self.is_fp16 = deepspeed
             self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
             self.device = "mps"
@@ -169,18 +169,19 @@ class IndexTTS2:
         else:
             self.gpt.eval()
         print(">> GPT weights restored from:", self.gpt_path)
-        if self.is_fp16:
+        
+        # PATCH: Make deepspeed optional and controlled by the UI toggle
+        use_deepspeed_runtime = False
+        if self.is_fp16:  # Only attempt to use deepspeed if the user toggled it on
             try:
                 import deepspeed
-
-                use_deepspeed = True
+                use_deepspeed_runtime = True
             except (ImportError, OSError, CalledProcessError) as e:
-                use_deepspeed = False
-                print(f">> DeepSpeed加载失败，回退到标准推理: {e}")
+                use_deepspeed_runtime = False
+                print(f">> DeepSpeed loading failed, falling back to standard inference: {e}")
+        
+        self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed_runtime, kv_cache=True, half=self.is_fp16)
 
-            self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
-        else:
-            self.gpt.post_init_gpt2_config(use_deepspeed=True, kv_cache=True, half=False)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -428,6 +429,7 @@ class IndexTTS2:
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
+            print("Use the specified emotion vector") # Added log
             emo_audio_prompt = None
             emo_alpha = 1.0
             # assert emo_audio_prompt is None
@@ -1045,8 +1047,6 @@ class IndexTTS:
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
-
-
     # 快速推理：对于“多句长文本”，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
     def infer_fast(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=100, sentences_bucket_max_size=4, **generation_kwargs):
         """
@@ -1753,11 +1753,6 @@ class IndexTTS2Run:
         use_random_s2=False, 
         ):
         
-        if deepspeed:
-            is_fp16 = True
-        else:
-            is_fp16 = False
-
         waveform = audio["waveform"].squeeze(0)
         sr = audio["sample_rate"]
         audio_prompt = AudioCacheManager(cache_dir).process_audio(waveform, sr)
@@ -1766,7 +1761,8 @@ class IndexTTS2Run:
 
         global INDEX_TTS2
         if INDEX_TTS2 is None:
-            INDEX_TTS2 = IndexTTS2(use_cuda_kernel=custom_cuda_kernel, is_fp16=is_fp16)
+            # PATCH: Pass the 'deepspeed' boolean from the UI to the class constructor
+            INDEX_TTS2 = IndexTTS2(use_cuda_kernel=custom_cuda_kernel, deepspeed=deepspeed)
 
         import ast
         if emo_vector is not None and len(emo_vector.strip()) > 17:
